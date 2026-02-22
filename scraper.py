@@ -1,13 +1,9 @@
 """
-Public Mutual Fund Intelligence - Fixed Scraper v2
-Uses direct Morningstar SecIDs - much more reliable than name search
+FundScope MY - Scraper v3
+No mstarpy dependency - pure direct HTTP to Morningstar
 """
 
-import json
-import datetime
-import time
-import math
-import urllib.request
+import json, datetime, time, math, urllib.request, urllib.error
 from pathlib import Path
 
 FUNDS = [
@@ -44,184 +40,191 @@ FUNDS = [
 ]
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://www.morningstar.com/",
+    "Origin": "https://www.morningstar.com",
 }
 
-def fetch_url(url, timeout=15):
+def fetch_url(url, timeout=20):
     try:
         req = urllib.request.Request(url, headers=HEADERS)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode())
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw)
     except Exception as e:
-        print(f"    HTTP error: {e}")
+        print(f"    fetch error: {e}")
         return None
 
-def fetch_nav_with_mstarpy(secid):
-    try:
-        import mstarpy
-        fund = mstarpy.Funds(term=secid, country="my", pageSize=1)
-        end_date = datetime.datetime.today()
-        start_date = end_date - datetime.timedelta(days=400)
-        nav_data = fund.nav(start_date, end_date)
-        if nav_data:
-            return [{"date": r["date"][:10], "nav": float(r["nav"])} for r in nav_data]
-    except Exception as e:
-        print(f"    mstarpy error: {e}")
-    return []
-
-def fetch_nav_direct(secid):
-    end = datetime.date.today()
-    start = end - datetime.timedelta(days=400)
+def fetch_nav_method1(secid):
+    """Morningstar timeseries API - compact JSON format"""
+    end   = datetime.date.today()
+    start = end - datetime.timedelta(days=500)
     url = (
         f"https://lt.morningstar.com/api/rest.svc/timeseries_price/9vehuxllxs"
-        f"?id={secid}%5D2%5D0%5DMYR&currencyId=MYR&idtype=Morningstar"
-        f"&frequency=daily&startDate={start.isoformat()}"
-        f"&endDate={end.isoformat()}&outputType=COMPACTJSON"
+        f"?id={secid}%5D2%5D0%5DMYR"
+        f"&currencyId=MYR&idtype=Morningstar&frequency=daily"
+        f"&startDate={start.isoformat()}&endDate={end.isoformat()}"
+        f"&outputType=COMPACTJSON"
     )
     data = fetch_url(url)
-    if data and isinstance(data, list) and len(data) > 0:
-        try:
-            series = data[0].get("TimeSeries", {}).get("Security", [])
-            if series:
-                return [
-                    {"date": item["EndDate"][:10], "nav": float(item["Value"])}
-                    for item in series[0].get("HistoryDetail", [])
-                    if item.get("Value")
-                ]
-        except Exception:
-            pass
-    return []
+    if not data or not isinstance(data, list):
+        return []
+    try:
+        history = data[0]["TimeSeries"]["Security"][0]["HistoryDetail"]
+        return [{"date": h["EndDate"][:10], "nav": float(h["Value"])}
+                for h in history if h.get("Value")]
+    except Exception as e:
+        print(f"    method1 parse error: {e}")
+        return []
+
+def fetch_nav_method2(secid):
+    """Morningstar graph data API"""
+    end   = datetime.date.today()
+    start = end - datetime.timedelta(days=500)
+    url = (
+        f"https://api.morningstar.com/v2/security/historical-price"
+        f"?id={secid}&currencyId=MYR&idtype=msid&frequency=daily"
+        f"&startDate={start.isoformat()}&endDate={end.isoformat()}"
+        f"&outputType=COMPACTJSON"
+    )
+    data = fetch_url(url)
+    if not data or "d" not in data:
+        return []
+    try:
+        return [{"date": row[0][:10], "nav": float(row[1])}
+                for row in data["d"] if len(row) >= 2]
+    except Exception as e:
+        print(f"    method2 parse error: {e}")
+        return []
+
+def fetch_nav_method3(secid):
+    """Morningstar fund quote API - gets at least current NAV"""
+    url = (
+        f"https://lt.morningstar.com/api/rest.svc/9vehuxllxs/security_details/{secid}"
+        f"?viewId=FundQuickTake&currencyId=MYR&idtype=msid"
+    )
+    data = fetch_url(url)
+    if not data:
+        return []
+    try:
+        # Extract whatever NAV data exists
+        results = []
+        rows = data.get("fund", {}).get("navHistory", [])
+        for row in rows:
+            results.append({"date": row["d"][:10], "nav": float(row["v"])})
+        return results
+    except Exception:
+        return []
 
 def fetch_nav(fund):
     secid = fund["secid"]
-    print(f"  {fund['name']}")
-    
-    result = fetch_nav_with_mstarpy(secid)
-    if result:
-        print(f"    ✓ {len(result)} NAV records (mstarpy)")
-        return result
-    
-    result = fetch_nav_direct(secid)
-    if result:
-        print(f"    ✓ {len(result)} NAV records (direct API)")
-        return result
-    
-    print(f"    ✗ No data retrieved")
+    name  = fund["name"]
+    print(f"  {name}")
+
+    for method_fn, label in [
+        (fetch_nav_method1, "timeseries"),
+        (fetch_nav_method2, "graph API"),
+        (fetch_nav_method3, "quote API"),
+    ]:
+        result = method_fn(secid)
+        if result:
+            print(f"    ✓ {len(result)} records via {label}")
+            return result
+
+    print(f"    ✗ all methods failed")
     return []
 
-def calculate_rsi(prices, period=14):
-    if len(prices) < period + 1:
-        return None
+# --- Indicators ---
+
+def rsi(prices, period=14):
+    if len(prices) < period + 1: return None
     gains, losses = [], []
     for i in range(1, len(prices)):
-        delta = prices[i] - prices[i-1]
-        gains.append(max(delta, 0))
-        losses.append(max(-delta, 0))
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
+        d = prices[i] - prices[i-1]
+        gains.append(max(d, 0)); losses.append(max(-d, 0))
+    ag = sum(gains[:period]) / period
+    al = sum(losses[:period]) / period
     for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period-1) + gains[i]) / period
-        avg_loss = (avg_loss * (period-1) + losses[i]) / period
-    if avg_loss == 0:
-        return 100.0
-    return round(100 - (100 / (1 + avg_gain/avg_loss)), 2)
+        ag = (ag*(period-1) + gains[i]) / period
+        al = (al*(period-1) + losses[i]) / period
+    if al == 0: return 100.0
+    return round(100 - 100/(1 + ag/al), 2)
 
-def calculate_ma(prices, period):
-    if len(prices) < period:
-        return None
-    return round(sum(prices[-period:]) / period, 4)
+def ma(prices, p):
+    return round(sum(prices[-p:])/p, 4) if len(prices) >= p else None
 
-def calculate_pct_change(prices, days):
-    if len(prices) < days + 1:
-        return None
+def pct(prices, days):
+    if len(prices) < days+1: return None
     old = prices[-(days+1)]
-    if old == 0:
-        return None
-    return round((prices[-1] - old) / old * 100, 2)
+    return round((prices[-1]-old)/old*100, 2) if old else None
 
-def calculate_volatility(prices, period=20):
-    if len(prices) < period + 1:
-        return None
-    returns = [(prices[i]-prices[i-1])/prices[i-1] for i in range(len(prices)-period, len(prices))]
-    mean = sum(returns) / len(returns)
-    variance = sum((r-mean)**2 for r in returns) / len(returns)
-    return round(math.sqrt(variance) * 100, 2)
+def vol(prices, p=20):
+    if len(prices) < p+1: return None
+    rets = [(prices[i]-prices[i-1])/prices[i-1] for i in range(len(prices)-p, len(prices))]
+    mean = sum(rets)/len(rets)
+    return round(math.sqrt(sum((r-mean)**2 for r in rets)/len(rets))*100, 2)
 
-def rsi_signal(rsi):
-    if rsi is None: return "N/A"
-    if rsi >= 70: return "OVERBOUGHT"
-    elif rsi <= 30: return "OVERSOLD"
-    elif rsi >= 55: return "BULLISH"
-    elif rsi <= 45: return "BEARISH"
+def rsi_label(v):
+    if v is None: return "N/A"
+    if v >= 70: return "OVERBOUGHT"
+    if v <= 30: return "OVERSOLD"
+    if v >= 55: return "BULLISH"
+    if v <= 45: return "BEARISH"
     return "NEUTRAL"
 
-def trend_signal(price, ma20, ma50):
+def trend(price, ma20, ma50):
     if not ma20 or not ma50: return "N/A"
     if price > ma20 > ma50: return "UPTREND"
-    elif price < ma20 < ma50: return "DOWNTREND"
+    if price < ma20 < ma50: return "DOWNTREND"
     return "SIDEWAYS"
 
-def compute_indicators(fund, nav_history):
-    if not nav_history or len(nav_history) < 5:
-        return None
-    sorted_nav = sorted(nav_history, key=lambda x: x['date'])
-    prices = [float(x['nav']) for x in sorted_nav]
-    rsi = calculate_rsi(prices)
-    ma20 = calculate_ma(prices, 20)
-    ma50 = calculate_ma(prices, 50)
+def indicators(fund, history):
+    if not history or len(history) < 5: return None
+    h = sorted(history, key=lambda x: x["date"])
+    p = [float(x["nav"]) for x in h]
+    r = rsi(p); m20 = ma(p,20); m50 = ma(p,50)
     return {
-        "fund_code": fund["code"],
-        "fund_name": fund["name"],
-        "secid": fund["secid"],
-        "date": sorted_nav[-1]['date'],
-        "nav": prices[-1],
-        "rsi_14": rsi,
-        "rsi_signal": rsi_signal(rsi),
-        "ma5": calculate_ma(prices, 5),
-        "ma20": ma20,
-        "ma50": ma50,
-        "trend": trend_signal(prices[-1], ma20, ma50),
-        "pct_1d": calculate_pct_change(prices, 1),
-        "pct_1w": calculate_pct_change(prices, 5),
-        "pct_1m": calculate_pct_change(prices, 21),
-        "pct_3m": calculate_pct_change(prices, 63),
-        "pct_1y": calculate_pct_change(prices, 252),
-        "volatility_20d": calculate_volatility(prices),
-        "data_points": len(prices),
+        "fund_code": fund["code"], "fund_name": fund["name"], "secid": fund["secid"],
+        "date": h[-1]["date"], "nav": p[-1],
+        "rsi_14": r, "rsi_signal": rsi_label(r),
+        "ma5": ma(p,5), "ma20": m20, "ma50": m50, "trend": trend(p[-1],m20,m50),
+        "pct_1d": pct(p,1), "pct_1w": pct(p,5), "pct_1m": pct(p,21),
+        "pct_3m": pct(p,63), "pct_1y": pct(p,252), "volatility_20d": vol(p),
+        "data_points": len(p),
     }
 
-def compute_flow_proxy(indicators_list):
-    valid = [f for f in indicators_list if f and f.get("pct_1m") is not None]
+def flow_proxy(ind_list):
+    valid = [f for f in ind_list if f and f.get("pct_1m") is not None]
     if not valid: return {}
-    returns = sorted([f["pct_1m"] for f in valid])
-    median = returns[len(returns)//2]
-    result = {}
+    median = sorted(f["pct_1m"] for f in valid)[len(valid)//2]
+    out = {}
     for f in valid:
         diff = f["pct_1m"] - median
-        result[f["fund_code"]] = {
-            "signal": "INFLOW" if diff > 1.5 else "OUTFLOW" if diff < -1.5 else "NEUTRAL",
-            "vs_category": round(diff, 2),
-            "note": f"{'+' if diff >= 0 else ''}{diff:.1f}% vs category median"
+        out[f["fund_code"]] = {
+            "signal": "INFLOW" if diff>1.5 else "OUTFLOW" if diff<-1.5 else "NEUTRAL",
+            "vs_category": round(diff,2),
+            "note": f"{'+' if diff>=0 else ''}{diff:.1f}% vs category median"
         }
-    return result
+    return out
 
-def rank_funds(indicators_list):
+def rank(ind_list):
     scored = []
-    for f in indicators_list:
+    for f in ind_list:
         if not f: continue
-        score = (f.get("pct_1w") or 0) * 0.4 + (f.get("pct_1m") or 0) * 0.4
-        if f.get("rsi_14"):
-            score += ((f["rsi_14"] - 50) / 50) * 20 * 0.2
-        scored.append({"fund_code": f["fund_code"], "score": round(score, 4)})
+        s = (f.get("pct_1w") or 0)*0.4 + (f.get("pct_1m") or 0)*0.4
+        if f.get("rsi_14"): s += ((f["rsi_14"]-50)/50)*20*0.2
+        scored.append({"code": f["fund_code"], "score": round(s,4)})
     scored.sort(key=lambda x: x["score"], reverse=True)
-    return {item["fund_code"]: {"rank": i+1, "score": item["score"]} for i, item in enumerate(scored)}
+    return {x["code"]: {"rank": i+1, "score": x["score"]} for i,x in enumerate(scored)}
 
-def run_daily_pipeline():
-    print(f"\n{'='*55}")
-    print(f"FundScope MY — {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    print(f"{'='*55}\n")
+# --- Main ---
+
+def run():
+    print(f"\n{'='*50}")
+    print(f"FundScope MY — {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} MYT")
+    print(f"{'='*50}\n")
 
     data_dir = Path("./data")
     data_dir.mkdir(exist_ok=True)
@@ -229,41 +232,39 @@ def run_daily_pipeline():
     nav_file = data_dir / "nav_history.json"
     all_nav = json.loads(nav_file.read_text()) if nav_file.exists() else {}
 
-    all_indicators = []
-
+    all_ind = []
     for fund in FUNDS:
         nav_data = fetch_nav(fund)
         if nav_data:
             existing = {r["date"]: r["nav"] for r in all_nav.get(fund["code"], [])}
-            for r in nav_data:
-                existing[r["date"]] = r["nav"]
-            all_nav[fund["code"]] = [{"date": d, "nav": v} for d, v in sorted(existing.items())]
-        
-        ind = compute_indicators(fund, all_nav.get(fund["code"], []))
-        if ind:
-            all_indicators.append(ind)
-        time.sleep(1.5)
+            for r in nav_data: existing[r["date"]] = r["nav"]
+            all_nav[fund["code"]] = [{"date":d,"nav":v} for d,v in sorted(existing.items())]
+        ind = indicators(fund, all_nav.get(fund["code"], []))
+        if ind: all_ind.append(ind)
+        time.sleep(1)
 
-    print(f"\n{len(all_indicators)}/{len(FUNDS)} funds loaded successfully\n")
+    print(f"\n{len(all_ind)}/{len(FUNDS)} funds loaded\n")
 
-    flow = compute_flow_proxy(all_indicators)
-    ranks = rank_funds(all_indicators)
+    fp = flow_proxy(all_ind)
+    rk = rank(all_ind)
 
     funds_out = []
-    for ind in all_indicators:
+    for ind in all_ind:
         code = ind["fund_code"]
         funds_out.append({
-            **{k: ind.get(k) for k in ["fund_code","fund_name","secid","nav","date",
-               "pct_1d","pct_1w","pct_1m","pct_3m","pct_1y",
-               "rsi_14","rsi_signal","ma5","ma20","ma50","trend","volatility_20d"]},
-            "code": code,
-            "name": ind["fund_name"],
-            "volatility": ind.get("volatility_20d"),
-            "flow_signal": flow.get(code, {}).get("signal", "N/A"),
-            "flow_vs_category": flow.get(code, {}).get("vs_category"),
-            "flow_note": flow.get(code, {}).get("note", ""),
-            "momentum_rank": ranks.get(code, {}).get("rank"),
-            "momentum_score": ranks.get(code, {}).get("score"),
+            "code": code, "name": ind["fund_name"], "secid": ind["secid"],
+            "nav": ind["nav"], "date": ind["date"],
+            "pct_1d": ind.get("pct_1d"), "pct_1w": ind.get("pct_1w"),
+            "pct_1m": ind.get("pct_1m"), "pct_3m": ind.get("pct_3m"),
+            "pct_1y": ind.get("pct_1y"), "rsi_14": ind.get("rsi_14"),
+            "rsi_signal": ind.get("rsi_signal"), "ma5": ind.get("ma5"),
+            "ma20": ind.get("ma20"), "ma50": ind.get("ma50"),
+            "trend": ind.get("trend"), "volatility": ind.get("volatility_20d"),
+            "flow_signal": fp.get(code,{}).get("signal","N/A"),
+            "flow_vs_category": fp.get(code,{}).get("vs_category"),
+            "flow_note": fp.get(code,{}).get("note",""),
+            "momentum_rank": rk.get(code,{}).get("rank"),
+            "momentum_score": rk.get(code,{}).get("score"),
             "top_holdings": [],
         })
 
@@ -271,23 +272,22 @@ def run_daily_pipeline():
 
     dashboard = {
         "last_updated": datetime.datetime.now().isoformat(),
-        "total_funds": len(funds_out),
-        "funds": funds_out,
+        "total_funds": len(funds_out), "funds": funds_out,
         "top_gainers_1d": sorted([f for f in funds_out if f.get("pct_1d")], key=lambda x: x["pct_1d"], reverse=True)[:5],
-        "top_losers_1d": sorted([f for f in funds_out if f.get("pct_1d")], key=lambda x: x["pct_1d"])[:5],
+        "top_losers_1d":  sorted([f for f in funds_out if f.get("pct_1d")], key=lambda x: x["pct_1d"])[:5],
         "top_momentum": funds_out[:5],
-        "oversold_funds": [f for f in funds_out if f.get("rsi_14") and f["rsi_14"] <= 35],
-        "inflow_signals": [f for f in funds_out if f.get("flow_signal") == "INFLOW"],
+        "oversold_funds": [f for f in funds_out if f.get("rsi_14") and f["rsi_14"]<=35],
+        "inflow_signals": [f for f in funds_out if f.get("flow_signal")=="INFLOW"],
     }
 
     nav_file.write_text(json.dumps(all_nav))
-    (data_dir / "indicators.json").write_text(json.dumps(all_indicators, indent=2))
-    (data_dir / "dashboard.json").write_text(json.dumps(dashboard, indent=2))
+    (data_dir/"indicators.json").write_text(json.dumps(all_ind, indent=2))
+    (data_dir/"dashboard.json").write_text(json.dumps(dashboard, indent=2))
 
-    print(f"✅ Done! {len(funds_out)} funds saved to data/dashboard.json")
+    print(f"✅ Saved! {len(funds_out)} funds → data/dashboard.json")
     if dashboard["top_gainers_1d"]:
-        top = dashboard["top_gainers_1d"][0]
-        print(f"   Top gainer: {top['name']} ({top.get('pct_1d',0):+.2f}%)")
+        t = dashboard["top_gainers_1d"][0]
+        print(f"   Best today: {t['name']} ({t.get('pct_1d',0):+.2f}%)")
 
 if __name__ == "__main__":
-    run_daily_pipeline()
+    run()
