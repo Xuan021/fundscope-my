@@ -1,1 +1,61 @@
+name: Daily Fund Intelligence Update
 
+on:
+  schedule:
+    # Runs at 9:30 PM MYT (1:30 PM UTC) on weekdays
+    # Public Mutual updates local fund NAV by 8pm, foreign by 12pm next day
+    - cron: '30 13 * * 1-5'
+  
+  # Allow manual trigger from GitHub UI
+  workflow_dispatch:
+
+jobs:
+  update-fund-data:
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: write  # Needed to push data files back to repo
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run data pipeline
+        run: |
+          python scraper.py
+        env:
+          PYTHONUNBUFFERED: 1
+
+      - name: Commit and push updated data
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "Fund Intelligence Bot"
+          git add data/
+          git diff --quiet && git diff --staged --quiet || git commit -m "📊 Daily fund update: $(date '+%Y-%m-%d')"
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Trigger Vercel/Netlify rebuild (optional)
+        if: success()
+        run: |
+          # Uncomment and add your deploy hook URL in GitHub Secrets
+          # curl -X POST "${{ secrets.DEPLOY_HOOK_URL }}"
+          echo "Data updated successfully. Frontend will auto-rebuild."
